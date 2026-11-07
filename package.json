@@ -23,7 +23,8 @@
     "test:watch": "vitest",
     "chaos": "vitest run test/chaos.test.ts",
     "cluster": "npm run build && node dist/cli/cluster.js",
-    "kv": "node dist/cli/kv.js"
+    "kv": "node dist/cli/kv.js",
+    "mutants": "node scripts/mutants.mjs"
   },
   "keywords": [
     "raft",

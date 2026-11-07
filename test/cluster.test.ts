@@ -47,6 +47,15 @@ describe('leader election', () => {
     expect(second.term).toBeGreaterThan(first.term);
   });
 
+  it('a single-node cluster elects itself and commits alone', () => {
+    const c = new SimCluster({ nodes: 1, seed: 6 });
+    const leader = c.waitForLeader();
+    const client = new SimClient(c, 'c1', { readMode: 'lease' });
+    exec(c, client, { type: 'put', key: 'solo', value: '1' });
+    expect(exec(c, client, { type: 'get', key: 'solo' })).toEqual({ value: '1' });
+    expect(leader.commit).toBe(2);
+  });
+
   it('cannot elect a leader without a majority', () => {
     const c = new SimCluster({ nodes: 5, seed: 3 });
     c.waitForLeader();
