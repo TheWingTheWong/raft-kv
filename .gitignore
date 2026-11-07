@@ -1,0 +1,6 @@
+node_modules/
+dist/
+coverage/
+.raft-data/
+*.log
+.DS_Store
