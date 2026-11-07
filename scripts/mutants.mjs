@@ -145,3 +145,4 @@ for (const m of selected) {
   }
 }
 console.log(`\n${killed}/${selected.length} mutants killed`);
+if (killed < selected.length) process.exitCode = 1;
