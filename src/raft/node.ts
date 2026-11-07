@@ -6,6 +6,8 @@ import {
   DEFAULT_CONFIG,
   type AppendEntries,
   type AppendEntriesReply,
+  type InstallSnapshot,
+  type InstallSnapshotReply,
   type LogEntry,
   type NodeId,
   type RaftConfig,
@@ -13,6 +15,7 @@ import {
   type RequestVote,
   type RequestVoteReply,
   type Role,
+  type Snapshot,
 } from './types.js';
 
 export interface Transport<C = unknown> {
@@ -88,6 +91,7 @@ export class RaftNode<C = unknown> {
   private currentTerm = 0;
   private votedFor: NodeId | null = null;
   private readonly log: RaftLog<C>;
+  private snapshot: Snapshot | null = null;
 
   // Volatile state.
   private _role: Role = 'follower';
@@ -206,6 +210,7 @@ export class RaftNode<C = unknown> {
     this.currentTerm = state.hardState.term;
     this.votedFor = state.hardState.votedFor;
     if (state.snapshot) {
+      this.snapshot = state.snapshot;
       this.log.resetToSnapshot(state.snapshot.lastIncludedIndex, state.snapshot.lastIncludedTerm);
       this.sm.restore(structuredClone(state.snapshot.data));
       this.commitIndex = this.lastApplied = state.snapshot.lastIncludedIndex;
@@ -278,6 +283,10 @@ export class RaftNode<C = unknown> {
         return this.onAppendEntries(from, msg);
       case 'AppendEntriesReply':
         return this.onAppendEntriesReply(from, msg);
+      case 'InstallSnapshot':
+        return this.onInstallSnapshot(from, msg);
+      case 'InstallSnapshotReply':
+        return this.onInstallSnapshotReply(from, msg);
       default:
         return;
     }
@@ -449,6 +458,19 @@ export class RaftNode<C = unknown> {
   private sendAppend(peer: NodeId): void {
     const pr = this.progress.get(peer)!;
     const prevLogIndex = pr.nextIndex - 1;
+    if (prevLogIndex < this.log.snapshotIndex) {
+      // The entries this peer needs have been compacted away.
+      const msg: InstallSnapshot = {
+        type: 'InstallSnapshot',
+        term: this.currentTerm,
+        leaderId: this.id,
+        snapshot: this.snapshot!,
+        seq: this.seq,
+        sentAt: this.clock.now(),
+      };
+      this.send(peer, msg);
+      return;
+    }
     const last = Math.min(this.log.lastIndex, prevLogIndex + this.config.maxEntriesPerMessage);
     const msg: AppendEntries<C> = {
       type: 'AppendEntries',
@@ -490,6 +512,19 @@ export class RaftNode<C = unknown> {
     if (next !== pr.nextIndex) {
       pr.nextIndex = next;
       this.sendAppend(from);
+    }
+  }
+
+  private onInstallSnapshotReply(from: NodeId, m: InstallSnapshotReply): void {
+    if (this._role !== 'leader' || m.term !== this.currentTerm) return;
+    const pr = this.progress.get(from);
+    if (!pr) return;
+    this.recordAck(pr, m.seq, m.sentAt);
+    if (m.matchIndex > pr.matchIndex) {
+      pr.matchIndex = m.matchIndex;
+      pr.nextIndex = Math.max(pr.nextIndex, m.matchIndex + 1);
+      this.maybeAdvanceCommit();
+      if (pr.nextIndex <= this.log.lastIndex) this.sendAppend(from);
     }
   }
 
@@ -601,6 +636,47 @@ export class RaftNode<C = unknown> {
     reply({ success: true, matchIndex: lastNew });
   }
 
+  private onInstallSnapshot(from: NodeId, m: InstallSnapshot): void {
+    const reply = (matchIndex: number): void =>
+      this.send(from, {
+        type: 'InstallSnapshotReply',
+        term: this.currentTerm,
+        matchIndex,
+        seq: m.seq,
+        sentAt: m.sentAt,
+      });
+
+    if (m.term < this.currentTerm) return reply(0);
+    this.acceptLeader(from);
+
+    const snap = m.snapshot;
+    const index = snap.lastIncludedIndex;
+    if (index <= this.commitIndex) {
+      // We already hold this prefix (committed entries match the leader's).
+      return reply(index);
+    }
+
+    if (this.log.term(index) === snap.lastIncludedTerm) {
+      // Our log extends past the snapshot consistently: keep the suffix.
+      this.log.compactThrough(index, snap.lastIncludedTerm);
+    } else {
+      this.log.resetToSnapshot(index, snap.lastIncludedTerm);
+    }
+    this.storage.saveSnapshot(snap, this.log.slice(index + 1));
+    this.snapshot = snap;
+    this.sm.restore(structuredClone(snap.data));
+    this.commitIndex = this.lastApplied = index;
+    // Proposals whose index is now inside the snapshot (or whose entries were
+    // discarded with the old log) can no longer be matched to a result.
+    for (const [i, p] of this.proposals) {
+      if (i <= index || this.log.term(i) !== p.term) {
+        this.proposals.delete(i);
+        p.callback({ ok: false, error: 'dropped', leaderHint: this._leaderId });
+      }
+    }
+    reply(index);
+  }
+
   private truncateLog(from: number): void {
     this.log.truncateFrom(from);
     this.storage.truncateFrom(from);
@@ -646,6 +722,22 @@ export class RaftNode<C = unknown> {
         );
       }
     }
+    this.maybeSnapshot();
+  }
+
+  /** Log compaction (§7): fold applied entries into a state machine snapshot. */
+  private maybeSnapshot(): void {
+    const threshold = this.config.snapshotThreshold;
+    if (threshold <= 0 || this.lastApplied - this.log.snapshotIndex < threshold) return;
+    const index = this.lastApplied;
+    const snap: Snapshot = {
+      lastIncludedIndex: index,
+      lastIncludedTerm: this.log.term(index)!,
+      data: this.sm.snapshot(),
+    };
+    this.log.compactThrough(index, snap.lastIncludedTerm);
+    this.storage.saveSnapshot(snap, this.log.slice(index + 1));
+    this.snapshot = snap;
   }
 
   // -------------------------------------------------------------------------
