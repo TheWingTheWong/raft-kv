@@ -1,5 +1,7 @@
 # raft-kv
 
+[![ci](https://github.com/TheWingTheWong/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/TheWingTheWong/raft-kv/actions/workflows/ci.yml)
+
 A key-value store replicated with Raft, written in TypeScript for Node. The
 protocol code is a single event-driven state machine with no I/O of its own,
 so the same `RaftNode` runs inside a deterministic simulator (virtual clock,
