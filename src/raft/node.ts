@@ -36,6 +36,18 @@ export type ProposeResult =
   | { ok: true; index: number; result: unknown }
   | { ok: false; error: RaftError; leaderHint: NodeId | null };
 
+export type ReadResult =
+  | { ok: true; result: unknown }
+  | { ok: false; error: RaftError; leaderHint: NodeId | null };
+
+/**
+ * How a linearizable read is confirmed without writing to the log.
+ * - read_index: confirm leadership with a heartbeat round (§6.4).
+ * - lease: skip the round trip while a majority-acknowledged lease holds
+ *   (§6.4.1); relies on bounded clock drift.
+ */
+export type LinearizableReadMode = 'read_index' | 'lease';
+
 export interface RaftNodeOptions<C> {
   id: NodeId;
   /** Every member of the cluster, including this node. */
@@ -59,6 +71,13 @@ interface PeerProgress {
   ackedSentAt: number;
   /** Local receive time of the latest acknowledgement (check-quorum). */
   lastAckAt: number;
+}
+
+interface PendingRead {
+  /** Heartbeat round that must be acknowledged by a majority. */
+  seq: number;
+  query: unknown;
+  callback: (result: ReadResult) => void;
 }
 
 interface PendingProposal {
@@ -122,6 +141,8 @@ export class RaftNode<C = unknown> {
   private seq = 0;
 
   private readonly proposals = new Map<number, PendingProposal>();
+  private pendingReads: PendingRead[] = [];
+  private flushStartsRound = false;
 
   constructor(options: RaftNodeOptions<C>) {
     if (!options.members.includes(options.id)) {
@@ -236,6 +257,7 @@ export class RaftNode<C = unknown> {
       this.proposals.delete(index);
       p.callback({ ok: false, error: 'dropped', leaderHint: null });
     }
+    this.failPendingReads('dropped');
   }
 
   // -------------------------------------------------------------------------
@@ -255,6 +277,28 @@ export class RaftNode<C = unknown> {
     this.proposals.set(entry.index, { term: entry.term, callback });
     this.maybeAdvanceCommit();
     this.scheduleFlush();
+  }
+
+  /**
+   * Linearizable read that bypasses the log. The query runs against the
+   * state machine once this node has proven it is still the leader and has
+   * applied everything committed before the read arrived.
+   */
+  read(query: unknown, mode: LinearizableReadMode, callback: (result: ReadResult) => void): void {
+    if (this.stopped || this._role !== 'leader') {
+      callback({ ok: false, error: 'not_leader', leaderHint: this._leaderId });
+      return;
+    }
+    if (mode === 'lease' && this.currentTermCommitted() && this.leaseValid()) {
+      callback({ ok: true, result: this.sm.query(query) });
+      return;
+    }
+    // Only acknowledgements of messages sent after this point prove that no
+    // newer leader existed when the read arrived.
+    this.pendingReads.push({ seq: this.seq + 1, query, callback });
+    this.flushStartsRound = true;
+    this.scheduleFlush();
+    this.processPendingReads();
   }
 
   // -------------------------------------------------------------------------
@@ -378,6 +422,7 @@ export class RaftNode<C = unknown> {
     this.setRole('follower');
     this._leaderId = leaderId;
     if (wasLeader) {
+      this.failPendingReads('not_leader');
       this.heartbeatTimer?.cancel();
       this.heartbeatTimer = null;
       this.flushTimer?.cancel();
@@ -451,6 +496,10 @@ export class RaftNode<C = unknown> {
     this.flushTimer = this.clock.setTimer(0, () => {
       this.flushTimer = null;
       if (this._role !== 'leader' || this.stopped) return;
+      if (this.flushStartsRound) {
+        this.flushStartsRound = false;
+        this.seq += 1;
+      }
       for (const p of this.peers) this.sendAppend(p);
     });
   }
@@ -490,7 +539,9 @@ export class RaftNode<C = unknown> {
     if (this._role !== 'leader' || m.term !== this.currentTerm) return;
     const pr = this.progress.get(from);
     if (!pr) return;
+    // Even a rejection proves the follower accepts us as leader of this term.
     this.recordAck(pr, m.seq, m.sentAt);
+    this.processPendingReads();
 
     if (m.success) {
       if (m.matchIndex > pr.matchIndex) {
@@ -520,6 +571,7 @@ export class RaftNode<C = unknown> {
     const pr = this.progress.get(from);
     if (!pr) return;
     this.recordAck(pr, m.seq, m.sentAt);
+    this.processPendingReads();
     if (m.matchIndex > pr.matchIndex) {
       pr.matchIndex = m.matchIndex;
       pr.nextIndex = Math.max(pr.nextIndex, m.matchIndex + 1);
@@ -548,6 +600,59 @@ export class RaftNode<C = unknown> {
     if (n > this.commitIndex && this.log.term(n) === this.currentTerm) {
       this.setCommitIndex(n);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Linearizable reads (leader side)
+  // -------------------------------------------------------------------------
+
+  /** True once an entry from the current term has committed (§6.4 step 1). */
+  private currentTermCommitted(): boolean {
+    return this.log.term(this.commitIndex) === this.currentTerm;
+  }
+
+  /** Highest heartbeat round acknowledged by a majority (self counts as acked). */
+  private quorumAckedSeq(): number {
+    const seqs = [Infinity];
+    for (const pr of this.progress.values()) seqs.push(pr.ackedSeq);
+    seqs.sort((a, b) => b - a);
+    return seqs[this.quorum() - 1]!;
+  }
+
+  /**
+   * The lease starts when the leader sent the latest message a majority has
+   * acknowledged. Those followers will not vote for anyone else until
+   * electionTimeoutMin after receiving it, so no other leader can exist
+   * before start + electionTimeoutMin (shrunk by the drift bound).
+   */
+  private leaseValid(): boolean {
+    const now = this.clock.now();
+    const sent = [now];
+    for (const pr of this.progress.values()) sent.push(pr.ackedSentAt);
+    sent.sort((a, b) => b - a);
+    const start = sent[this.quorum() - 1]!;
+    const duration = this.config.electionTimeoutMin * (1 - this.config.clockDriftBound);
+    return now < start + duration;
+  }
+
+  private processPendingReads(): void {
+    if (this._role !== 'leader' || this.pendingReads.length === 0) return;
+    if (!this.currentTermCommitted()) return;
+    // Entries apply synchronously on commit, so lastApplied === commitIndex
+    // here and the read index is satisfied immediately.
+    if (this.lastApplied < this.commitIndex) return;
+    const confirmed = this.quorumAckedSeq();
+    let n = 0;
+    while (n < this.pendingReads.length && this.pendingReads[n]!.seq <= confirmed) n++;
+    if (n === 0) return;
+    const ready = this.pendingReads.splice(0, n);
+    for (const r of ready) r.callback({ ok: true, result: this.sm.query(r.query) });
+  }
+
+  private failPendingReads(error: RaftError): void {
+    const reads = this.pendingReads;
+    this.pendingReads = [];
+    for (const r of reads) r.callback({ ok: false, error, leaderHint: this._leaderId });
   }
 
   private hasRecentQuorum(): boolean {
@@ -702,6 +807,7 @@ export class RaftNode<C = unknown> {
       }
     }
     this.applyCommitted();
+    this.processPendingReads();
   }
 
   private applyCommitted(): void {

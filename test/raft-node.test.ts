@@ -204,3 +204,73 @@ describe('RaftNode log consistency', () => {
     expect(h.node.commit).toBe(1);
   });
 });
+
+describe('RaftNode linearizable reads', () => {
+  function leader() {
+    const h = harness();
+    h.clock.runFor(150);
+    h.node.receive('b', { type: 'RequestVoteReply', term: 1, voteGranted: true });
+    expect(h.node.role).toBe('leader');
+    const appends = h.take('AppendEntries');
+    const ack = (from: string, seq: number, sentAt: number, matchIndex = 1) =>
+      h.node.receive(from, {
+        type: 'AppendEntriesReply',
+        term: 1,
+        success: true,
+        matchIndex,
+        conflictIndex: 0,
+        conflictTerm: 0,
+        seq,
+        sentAt,
+      });
+    return { ...h, seq: appends[0]!.msg.seq, ack };
+  }
+
+  it('read_index waits for the no-op to commit and for a fresh heartbeat round', () => {
+    const h = leader();
+    const results: unknown[] = [];
+    h.node.read('q', 'read_index', (r) => results.push(r));
+    h.ack('b', h.seq, h.clock.now()); // commits the no-op, but the ack predates the read
+    expect(h.node.commit).toBe(1);
+    expect(results).toEqual([]);
+
+    h.clock.runFor(0); // flush starts a new round
+    const round = h.take('AppendEntries');
+    expect(round).toHaveLength(2);
+    expect(round[0]!.msg.seq).toBe(h.seq + 1);
+    h.ack('c', h.seq + 1, h.clock.now());
+    expect(results).toEqual([{ ok: true, result: [] }]);
+  });
+
+  it('lease reads are served locally while a majority ack is fresh', () => {
+    const h = leader();
+    h.ack('b', h.seq, h.clock.now());
+    const results: unknown[] = [];
+    h.node.read('q', 'lease', (r) => results.push(r));
+    expect(results).toEqual([{ ok: true, result: [] }]);
+
+    // After the lease (150ms * 0.9) runs out the read needs a round trip.
+    h.clock.runFor(140);
+    h.outbox.length = 0;
+    h.node.read('q', 'lease', (r) => results.push(r));
+    expect(results).toHaveLength(1);
+  });
+
+  it('fails pending reads when the leader steps down', () => {
+    const h = leader();
+    const results: unknown[] = [];
+    h.node.read('q', 'read_index', (r) => results.push(r));
+    h.node.receive('c', {
+      type: 'AppendEntriesReply',
+      term: 2,
+      success: false,
+      matchIndex: 0,
+      conflictIndex: 0,
+      conflictTerm: 0,
+      seq: 0,
+      sentAt: 0,
+    });
+    expect(h.node.role).toBe('follower');
+    expect(results).toEqual([{ ok: false, error: 'not_leader', leaderHint: null }]);
+  });
+});
